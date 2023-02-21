@@ -1,0 +1,1480 @@
+---
+title: "Entrega grupal II"
+description: |
+  Aplicando KNN, Árbol, Random Forest y regresión logística a titanic.csv
+author:
+  - name: Iván González, Qiqi Zhou y Felipe Reyes
+    affiliation: Universidad Complutense de Madrid
+    affiliation_url: https://ucm.es
+date: "`r Sys.Date()`"
+output:
+    distill::distill_article:
+        highlight: kate
+        colorlinks: true
+        code_folding: false
+        toc: true            
+        toc_depth: 3     
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+```{r setup, include = FALSE}
+# Ajuste comunes de los chunk
+knitr::opts_chunk$set(message = FALSE, warning = FALSE,
+                      echo = TRUE, res = 400)
+```
+
+# Objetivo
+
+El objetivo de esta práctica es **clasificar** a los pasajeros que **sobrevivieron** al **accidente del transatlántico RMS Titanic** de aquellos que **no lo lograron** a través de distintos **algoritmos de clasificación**.
+
+## Paquetes necesarios
+
+Necesitaremos los siguientes paquetes:
+
+```{r paquetes}
+# Borramos
+rm(list = ls())
+
+# Paquetes
+library(skimr) # Resumen numérico
+library(tidymodels) # Depuración datos
+library(tidyverse) # Modelos
+library(outliers) # Outliers
+library(themis) # Sobremuestreo
+library(parallel) # Fase de validación
+library(doParallel) # Fase de validación
+library(rpart.plot) # Visualización de árboles
+library(ggthemes)
+library(glue)
+library(ranger) # Random Forest
+library(vip)
+```
+
+# Datos
+
+Los datos que usaremos provienen del **dataset titanic_train.csv**.
+
+```{r}
+titanic_bruto <- read_csv(file = "/Users/leztin/Desktop/DATOS/titanic_train.csv")
+```
+
+## Análisis exploratorio inicial (numérico)
+
+Antes de tomar cualquier decisión con los datos, lo primero que haremos será **echar un vistazo numérico** a cómo se comportan las variables.
+Dado que vamos a clasificar, en primer lugar comprobaremos **cómo se distribuyen** los niveles de nuestra **variable objetivo**.
+
+### Variables
+
+Lo primero es conocer nuestras variables.
+
+```{r}
+glimpse(titanic_bruto)
+```
+
+-   `PassengerId`: ID del pasajero.
+-   `Survived`: ¿el pasajero sobrevivió o no? (0 = No / 1 = Sí)
+-   `Pclass`: clases de ticket (primera, segunda y tercera clase).
+-   `Name`: nombre del pasajero.
+-   `Sex`: sexo del pasajero.
+-   `Age`: edad del pasajero.
+-   `SibSp`: número de hermanos y cónyuges a bordo de la embarcación.
+-   `Parch`: número de padres e hijos a bordo de la embarcación
+-   `Ticket`: número del ticket.
+-   `Fare`: tarifa del pasajero.
+-   `Cabin`: número de camarote.
+-   `Embarked`: puerta de embarque (Cherbourg, Queenstown o Southampton).
+
+### Balance de la variable objetivo
+
+El objetivo será **predecir si un sobrevivió al accidente**, por lo que `Survived` será nuestra **variable objetivo**.
+En primer lugar comprobaremos cómo se **distribuyen los niveles de la objetivo**, que además es una variable binaria.
+
+```{r}
+# Objetivo: predecir si un pasajero sobrevivió al accidente del transatlántico RMS Titanic o no
+titanic_bruto |>
+  count(Survived) |>
+  mutate(porc = 100 * n / sum(n))
+```
+
+Graficaremos estas proporciones a través de un gráfico de barras:
+
+```{r fig1, fig.width = 9, fig.asp = 0.62}
+titanic_bruto |> 
+  mutate(Survived = as.factor(Survived)) |> 
+  count(Survived) |>
+  mutate(porc = n / sum(n)) |> 
+  ggplot(aes(Survived, porc, fill = Survived)) +
+  geom_col(position = "dodge", color = "black") +
+  scale_y_continuous(labels = scales::percent_format(), limit = c(0,0.7)) +
+  labs(title = "Proporción de pasajeros que sobrevivieron al accidente", x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(text = element_text(face = "bold", size = 15), plot.title = element_text(hjust = 0.5)) +
+  scale_fill_discrete(name = "¿Sobrevivió?", labels = c("No", "Sí")) +
+  geom_text(aes(label = scales::percent(porc)), position = position_dodge(width = 0.9), vjust = -1) +
+  scale_x_discrete(labels = c("0" = "No","1" = "Sí"))
+```
+
+# Fase 2: Exploración de los datos
+
+## Variables tipo texto, variables numéricas y factores
+
+Tras esta pequeña aproximación al dataset, comienza la **primera fase** de la metodología SEMMA para el depurado de nuestros datos.
+En este primer apartado comprobaremos que todas las variables estén codificadas en su **tipología correcta**: debemos decidir si las variables de tipo texto son **variables cualitativas** (factores) o meros id's.
+
+```{r}
+titanic_bruto |>  
+  select(where(is.numeric)) |>
+  glimpse()
+```
+
+Encontramos en el dataset que **algunas** de las **variables numéricas** representan categorías que pueden expresarse como **cualitativas**.
+Las variables `Survived`, `Pclass`, `SibSp` y `Parch` toman valores únicos de, como máximo, **siete categorías**, por lo que podemos transformarlas a variables tipo texto y luego a factor para mayores facilidades en su manipulación.
+Modificamos en primer lugar esta cuestión:
+
+```{r}
+titanic <-
+  titanic_bruto |> 
+  mutate(Survived = as.character(Survived),
+         Pclass = as.character(Pclass),
+         SibSp = as.character(SibSp),
+         Parch = as.character(Parch))
+titanic |> 
+  glimpse()
+```
+
+Ahora sí, todas las variables tipo texto representan **categorías de una cualitativa**, por lo que las convertimos todas ellas a **factor**.
+
+```{r}
+titanic <- 
+  titanic |>
+  mutate(across(where(is.character), as_factor))
+titanic |> 
+  glimpse()
+```
+
+### Factores ordinales
+
+La variable `Pclass`, además de **factor**, también puede seguir una **jerarquía** ordinal: `3` \< `2` \< `1`.
+De esta manera, ordenaríamos los tickets en función de su **clase** (1ª, 2ª y 3ª clase).
+
+```{r}
+titanic |>
+  count(Pclass) |> 
+  mutate(porc = 100*n/sum(n))
+```
+
+Convertimos `Pclass` a cualitativa pero ordinal.
+
+```{r}
+titanic <-
+  titanic |>
+  mutate(Pclass = factor(Pclass, levels = c("3", "2", "1"),
+                       ordered = TRUE))
+```
+
+## Variables cualitativas
+
+### Variable Survived
+
+```{r}
+titanic |>
+  count(Survived, sort = TRUE) |>
+  mutate(porc = 100*n/sum(n))
+```
+
+La variable `Survived` es una variable **binaria** y nuestra variable **objetivo**, por lo que la **mantendremos** tal y como está.
+
+### Variable Pclass
+
+```{r}
+titanic |>
+  count(Pclass, sort = TRUE) |>
+  mutate(porc = 100*n/sum(n))
+```
+
+La variable `Pclass` presenta **3 modalidades**.
+Además, **una** de ellas acapara el **55 %** del total de los registros.
+Comprobemos ahora su afectación sobre nuestra variable objetivo.
+
+```{r}
+titanic |>
+  group_by(Pclass) |> 
+  count(Survived) |>
+  mutate(porc = 100*n/sum(n)) |> 
+  ungroup()
+```
+
+```{r fig2, layout="l-body-outset", fig.width = 13, fig.asp = 0.6}
+titanic |> 
+  group_by(Pclass) |> 
+  count(Survived) |>
+  mutate(porc = n / sum(n)) |> 
+  mutate(conteo = n) |> 
+  ggplot(aes(x = reorder(Pclass, -conteo), y = conteo, fill = Survived)) +
+  geom_col(position = "dodge", color = "black") +
+  labs(title = "Distribución de los supervivientes al accidente en función de la clase de su ticket", x = "Clase", y = "Conteo") +
+  scale_y_continuous(limit = c(0,400)) +
+  theme_minimal() +
+  theme(text = element_text(face = "bold", size = 15), plot.title = element_text(hjust = 0.5), 
+  axis.title.x = element_text(vjust = -0.5), axis.title.y = element_text(vjust = 2)) +
+  scale_fill_discrete(name = "¿Sobrevivió?", labels = c("No", "Sí")) +
+  geom_text(aes(label = scales::percent(porc)), position = position_dodge(width = 1), vjust = -1) +
+  scale_x_discrete(labels = c("1" = "Primera clase","2" = "Segunda clase", "3" = "Tercera clase"))
+```
+
+Algunas apreciaciones a la luz del gráfico:
+
+-   La variable se relaciona con nuestra variable objetivo de una forma **muy interesante**. En este sentido, se puede establecer una **relación directa** entre **clase** y **probabilidad de supervivencia**.
+-   La categoría `3` (tercera clase), a parte de ser la mayoritaria, también es la peor a nivel de supervivencia: **más del 70 %** de los pasajeros de tercera clase, **fallecieron en el accidente**.
+-   La categoría `2` (segunda clase) es la minoritaria (20 % sobre el total de los registros de la variable). En su caso, la distribución respecto de nuestra variable objetivo está **bastante igualada**, reduciéndose en un **20 %** la probabilidad de **muerte** en comparación con los pasajeros de tercera clase.
+-   La categoría `1` (primera clase) es la única clase en la que **la proporción de supervivientes supera a la de fallecidos**. Ello puede ser debido a que los camarotes en los que se encontraban la noche en la que sucedió la colisión eran más **amplios** o estaban **mejor situados** y tardaron más en hundirse que los camarotes del resto de clases. También es posible que los **botes salvavidas** y la **cubierta de botes** se encontraran **más cercanos** a los mejores camarotes que al resto.
+
+Con ello en mente, se optará en la fase de **recategorización** por **mantener** las tres categorías.
+
+### Variable Name
+
+```{r}
+titanic |>
+  count(Name, sort = TRUE) |>
+  mutate(porc = 100*n/sum(n))
+```
+
+La variable `Name` presenta **891 modalidades**, una por cada pasajero en nuestro dataset.
+Dado que es una **variable identificador** y, como es obvio, es única para cada pasajero, *a priori* no parece interesante el mantenerla como tal.
+Si se observa la construcción de cada registro, observamos en primer lugar el **apellido** del pasajero seguido de una **coma**, el **título de tratamiento asociado**, y, por último, su **nombre**.
+De toda esta información, lo que quizá pueda resultar interesante a fin de comparar con nuestra variable objetivo podría ser el **título asociado a cada individuo** (aporta un poco más de información que el sexo del individuo).
+Extraeremos a continuación esta información.
+
+```{r}
+titanic <-
+  titanic |>
+  separate(Name, sep = ",", into = c("Surname", "Title")) |> 
+  separate(Title, sep = " ", into = c("Name", "Title")) |> 
+  select(-c(Surname, Name))
+```
+
+Comprobaremos a continuación la representatividad de las categorías de la nueva variable `Title` y de su afectación sobre nuestra variable objetivo.
+
+```{r}
+titanic |>
+  count(Title, sort = TRUE) |>
+  mutate(porc = 100*n/sum(n))
+
+titanic |>
+  group_by(Title) |> 
+  count(Survived) |>
+  mutate(porc = 100*n/sum(n)) |> 
+  ungroup()
+```
+
+```{r fig3, layout="l-body-outset", fig.width = 13, fig.height= 23}
+titanic |> 
+  group_by(Title) |> 
+  count(Survived) |>
+  mutate(porc = n / sum(n)) |> 
+  mutate(conteo = n) |> 
+  ggplot(aes(x = reorder(Title, -conteo), y = conteo, fill = Survived)) +
+  geom_bar(stat = "identity", position = "dodge", color = "black", width = 0.4) +
+  labs(title = "Distribución de los supervivientes al accidente en función de su título de tratamiento", x = "Título", y = "Conteo") +
+  scale_y_continuous(limit = c(0,550)) +
+  theme_minimal() +
+  theme(text = element_text(face = "bold", size = 15), plot.title = element_text(hjust = 0.5), 
+  axis.title.x = element_text(vjust = -0.5), axis.title.y = element_text(vjust = 2)) +
+  scale_fill_discrete(name = "¿Sobrevivió?", labels = c("No", "Sí")) +
+  geom_text(aes(label = scales::percent(porc)), position = position_dodge(width = 0.5), hjust = -0.4, size = 4) +
+  coord_flip()
+```
+
+Algunas apreciaciones a la luz del gráfico:
+
+-   Los títulos de tratamiento mayoritarios son `Mr.`, `Miss.`, `Mrs.` y `Master`.
+-   La gran mayoría de `Mr.` fallecieron en el accidente (casi un 85 %), pero las proporciones se invierten para las `Miss.` y para las `Mrs.` Para estas categorías, **el 80 y el 70 %** de `Mrs.` y `Miss.`, respectivamente, **sobrevivieron**. Esto puede ser debido, fundamentalmente, a que los primeros grupos de personas en ser **evacuados** de la embarcación fueron las **mujeres** y los **niños**.
+-   La categoría `Master.` se empleaba antaño para hombres jóvenes. Para este caso, también hubo **más supervivientes que fallecidos**, por el mismo motivo que en el caso anterior.
+
+Con ello en mente, se optará en la fase de **recategorización** por **mantener** estas **cuatro** categorías y agrupar el resto en un `Others`.
+
+### Variable Sex
+
+```{r}
+titanic |>
+  count(Sex, sort = TRUE) |>
+  mutate(porc = 100*n/sum(n))
+```
+
+La variable `Sex` presenta **2 modalidades**, por lo que se trata de una **variable binaria**.
+La **proporción** de los registros favorece a los individuos de sexo **masculino**, con un **65 %** sobre el total (2/3).
+Comprobemos ahora su afectación sobre nuestra variable objetivo.
+
+```{r}
+titanic |>
+  group_by(Sex) |> 
+  count(Survived) |>
+  mutate(porc = 100*n/sum(n)) |> 
+  ungroup()
+```
+
+```{r fig4, layout="l-body-outset", fig.width=13, fig.asp = .6}
+hombre <- 
+  titanic |> 
+  filter(Sex == "male") |> 
+  group_by(Survived) |>
+  summarise(n = n()) |> 
+  ggplot(aes(x = "", y = n, fill = Survived)) + 
+  geom_bar(stat = "identity", color = "black") + 
+  coord_polar("y") + geom_text(aes(label = paste(100 * round(n/577, 2), "%")), 
+                               position = position_stack(vjust = 0.5), check_overlap = T, size = 5) + 
+  labs(x = NULL, y = NULL, fill = NULL, title = "Distribución de los supervivientes al accidente \npara individuos de sexo masculino") + 
+  theme_minimal() +
+  theme(axis.line = element_blank(), text = element_text(face = "bold", size = 12), axis.text = element_blank(), 
+        axis.ticks = element_blank(), plot.title = element_text(hjust = 0.5)) +
+  scale_fill_discrete(name = "¿Sobrevivió?", labels = c("No", "Sí"))
+
+mujer <-
+  titanic |> 
+  filter(Sex == "female") |> 
+  group_by(Survived) |>
+  summarise(n = n()) |> 
+  ggplot(aes(x = "", y = n, fill = Survived)) + 
+  geom_bar(stat = "identity", width = 2, color = "black") + 
+  coord_polar("y") + geom_text(aes(label = paste(100 * round(n/314, 2), "%")), 
+                               position = position_stack(vjust = 0.5), check_overlap = T, size = 5) + 
+  labs(x = NULL, y = NULL, fill = NULL, title = "Distribución de los supervivientes al accidente \npara individuos de sexo femenino") + 
+  theme_minimal() +
+  theme(axis.line = element_blank(), text = element_text(face = "bold", size = 12), axis.text = element_blank(), 
+        axis.ticks = element_blank(), plot.title = element_text(hjust = 0.5)) +
+  scale_fill_discrete(name = "¿Sobrevivió?", labels = c("No", "Sí"))
+
+Rmisc:::multiplot(hombre, mujer, cols = 2)
+```
+
+-   Esta variable está **muy desbalanceada**. Cerca de **2/3** de los registros pertenecen únicamente al **sexo masculino** (`Male`).
+-   De esta variable podemos sacar conclusiones muy similares a las de la variable `Title`. En definitiva, como las **mujeres y los niños** fueron los **primeros** en abandonar la embarcación, tuvieron también **mayores posibilidades de sobrevivir**.
+
+En la fase recategorización se deberá tomar la decisión de eliminar una de las dos variables: `Title` o `Sex`.
+Ambas explican cuestiones muy similares.
+
+### Variable SibSp
+
+```{r}
+titanic |>
+  count(SibSp, sort = TRUE) |>
+  mutate(porc = 100*n/sum(n))
+```
+
+La variable `SibSp` presenta **7 modalidades**.
+Además, tan solo **una** de ellas acapara el **68 %** del total de los registros.
+Comprobemos ahora su afectación sobre nuestra variable objetivo.
+
+```{r}
+titanic |>
+  group_by(SibSp) |> 
+  count(Survived) |>
+  mutate(porc = 100*n/sum(n)) |> 
+  ungroup()
+```
+
+```{r fig5, layout="l-body-outset", fig.width = 13, fig.asp = 0.6}
+titanic |> 
+  group_by(SibSp) |> 
+  count(Survived) |>
+  mutate(porc = n / sum(n)) |> 
+  mutate(conteo = n) |> 
+  ggplot(aes(x = reorder(SibSp, -conteo), y = conteo, fill = Survived)) +
+  geom_col(position = "dodge", color = "black") +
+  labs(title = "Distribución de los supervivientes al accidente en función del número de hermanos y/o cónyuges", x = "Hermanos y/o cónyuges", y = "Conteo") +
+  scale_y_continuous(limit = c(0,400)) +
+  theme_minimal() +
+  theme(text = element_text(face = "bold", size = 15), plot.title = element_text(hjust = 0.5), 
+  axis.title.x = element_text(vjust = -0.5), axis.title.y = element_text(vjust = 2)) +
+  scale_fill_discrete(name = "¿Sobrevivió?", labels = c("No", "Sí")) +
+  geom_text(aes(label = scales::percent(porc)), position = position_dodge(width = 1), vjust = -1)
+```
+
+Algunas apreciaciones a la luz del gráfico:
+
+-   La categoría `0` es la **mayoritaria**, y mantiene una distribución **muy similar** a la de la variable objetivo **(65 % / 35 %)**.
+-   La categoría `1` es la única categoría en donde el **porcentaje de supervivientes** es **mayor** que el de fallecidos. Parece ser que las personas que embarcaron con su pareja o con su hermano finalmente tuvieron más posibilidades de sobrevivir.
+-   El resto de categorías son **poco representativas** y mantienen una distribución **similar** en donde el porcentaje de pasajeros fallecidos supera al de supervivientes.
+
+Con ello en mente, se optará en la fase de **recategorización** por:
+
+-   Mantener las categorías `0` y `1` tal y como están.
+-   Agrupar las categorías `2`, `3`, `4`, `5` y `8` en una sola.
+
+### Variable Parch
+
+```{r}
+titanic |>
+  count(Parch, sort = TRUE) |>
+  mutate(porc = 100*n/sum(n))
+```
+
+La variable `Parch` presenta **7 modalidades**.
+Además, tan solo **una** de ellas acapara el **76 %** del total de los registros.
+Comprobemos ahora su afectación sobre nuestra variable objetivo.
+
+```{r}
+titanic |>
+  group_by(Parch) |> 
+  count(Survived) |>
+  mutate(porc = 100*n/sum(n)) |> 
+  ungroup()
+```
+
+```{r fig6, layout="l-body-outset", fig.width = 13, fig.asp = 0.6}
+titanic |> 
+  group_by(Parch) |> 
+  count(Survived) |>
+  mutate(porc = n / sum(n)) |> 
+  mutate(conteo = n) |> 
+  ggplot(aes(x = reorder(Parch, -conteo), y = conteo, fill = Survived)) +
+  geom_col(position = "dodge", color = "black") +
+  labs(title = "Distribución de los supervivientes al accidente en función del número de padres y/o hijos", x = "Padres y/o hijos", y = "Conteo") +
+  scale_y_continuous(limit = c(0,450)) +
+  theme_minimal() +
+  theme(text = element_text(face = "bold", size = 15), plot.title = element_text(hjust = 0.5), 
+  axis.title.x = element_text(vjust = -0.5), axis.title.y = element_text(vjust = 2)) +
+  scale_fill_discrete(name = "¿Sobrevivió?", labels = c("No", "Sí")) +
+  geom_text(aes(label = scales::percent(porc)), position = position_dodge(width = 1), vjust = -1)
+```
+
+Algunas apreciaciones a la luz del gráfico:
+
+-   La categoría `0` es la **mayoritaria**, y mantiene una distribución **muy similar** a la de la variable objetivo **(65 % / 35 %)**.
+-   La categoría `1` es la única categoría en donde el **porcentaje de supervivientes** es **mayor** que el de fallecidos. Parece ser que las personas que embarcaron con su padre o con su hijo finalmente tuvieron más posibilidades de sobrevivir.
+-   Para la categoría `2`, fallecieron el mismo número de personas que finalmente pudieron salvarse.
+-   El resto de categorías son **poco representativas** y mantienen una distribución **similar**.
+
+Con ello en mente, se optará en la fase de **recategorización** por:
+
+-   Mantener las categorías `0`, `1` y `2` tal y como están.
+-   Agrupar las categorías `3`, `4`, `5` y `6` en una sola.
+
+### Variable Ticket
+
+```{r}
+titanic |>
+  count(Ticket, sort = TRUE) |>
+  mutate(porc = 100*n/sum(n))
+```
+
+La variable `Ticket` presenta **681 modalidades**, prácticamente una por cada pasajero en nuestro dataset.
+Dado que es similar a una **variable identificador**, *a priori* no parece interesante el mantenerla como tal.
+En la fase de **recategorización** se optará por **eliminar** esta variable.
+
+### Variable Cabin
+
+```{r}
+titanic |>
+  count(Cabin, sort = TRUE) |>
+  mutate(porc = 100*n/sum(n))
+```
+
+La variable `Cabin` presenta **148 modalidades**, pero el **77 %** son datos ausentes.
+Comprobemos ahora su afectación sobre nuestra variable objetivo.
+Dado que más del **75 % de los datos son ausentes** y a que tampoco sabemos con certeza cómo agrupar el resto de variables, se optará en la fase de recategorización por **eliminar** esta variable.
+
+A pesar de que, obviamente, no disponemos de la información, sí que podría resultar interesante el consultar un mapa en el que aparezca la **localización** por sectores de todos los **camarotes**.
+Si lo tuviéramos a mano, podríamos **agrupar el código de los camarotes** en función de la **cercanía** o **lejanía** a las **áreas de evacuación** e incluir estos clústeres en nuestro modelo.
+
+### Variable Embarked
+
+```{r}
+titanic |>
+  count(Embarked, sort = TRUE) |>
+  mutate(porc = 100*n/sum(n))
+```
+
+La variable `Embarked` presenta **4 modalidades**.
+Además, tan solo **una** de ellas acapara el **72 %** del total de los registros.
+Comprobemos ahora su afectación sobre nuestra variable objetivo.
+
+```{r}
+titanic |>
+  group_by(Embarked) |> 
+  count(Survived) |>
+  mutate(porc = 100*n/sum(n)) |> 
+  ungroup()
+```
+
+```{r fig7, layout="l-body-outset", fig.width = 13, fig.asp = 0.6}
+titanic |> 
+  group_by(Embarked) |> 
+  count(Survived) |>
+  mutate(porc = n / sum(n)) |> 
+  mutate(conteo = n) |> 
+  ggplot(aes(x = reorder(Embarked, -conteo), y = conteo, fill = Survived)) +
+  geom_col(position = "dodge", color = "black") +
+  labs(title = "Distribución de los supervivientes al accidente en función de la puerta de embarque", x = "Puerta de embarque", y = "Conteo") +
+  scale_y_continuous(limit = c(0,450)) +
+  theme_minimal() +
+  theme(text = element_text(face = "bold", size = 15), plot.title = element_text(hjust = 0.5), 
+  axis.title.x = element_text(vjust = -0.5), axis.title.y = element_text(vjust = 2)) +
+  scale_fill_discrete(name = "¿Sobrevivió?", labels = c("No", "Sí")) +
+  geom_text(aes(label = scales::percent(porc)), position = position_dodge(width = 1), vjust = -1)
+```
+
+Algunas apreciaciones a la luz del gráfico:
+
+-   La mayoría de pasajeros embarcaron por la puerta `S` (Southampton). Además, esta categoría mantiene una distribución **muy similar** a la de nuestra variable objetivo **(65 % / 35 %)**.
+-   La categoría `C` (Cherbourg) es la única en la que el porcentaje de supervivientes supera al de fallecidos. Es posible que los pasajeros que accedieran por esta puerta estuvieran ubicados en camarotes cercanos a los puntos de extracción.
+-   La categoría `Q` (Queenstown) es la minoritaria, y también mantiene una distribución **muy similar** a la de nuestra variable objetivo **(65 % / 35 %)**.
+
+Con ello en mente, se optará en la fase de **recategorización** por:
+
+-   Mantener las categorías `S`, `C` y `Q` tal y como están.
+-   Agrupar los datos ausentes `NA` en `C`.
+
+### Dependencia entre variables cualitativas
+
+Para terminar, comprobaremos a continuación los posibles **problemas de independencia** entre nuestras variables **cualitativas** respecto de la objetivo.
+Para ello, se ejecutará una **prueba** $\chi^2$ de **independencia** para comprobar si las variables predictoras cualitativas son **dependientes** o no de nuestra **variable objetivo**.
+Con un nivel de significación ($\alpha$) = 0.05, si el p-valor \< 0.05, rechazaríamos la **hipótesis nula de independencia** a ese mismo nivel de significación.
+
+```{r}
+chisq <-
+  tibble("variable" = titanic |> select(where(is.factor)) |> names(),
+         "p_value" = titanic |> select(where(is.factor)) |>
+           map_dbl(.f = function(x) { chisq.test(titanic$Survived, x)$p.value}))
+chisq |> arrange(desc(p_value))
+```
+
+```{r}
+chisq |> filter(p_value > 0.05)
+```
+
+A la luz de los resultados, hay evidencia empírica suficiente para **rechazar al 5 % de nivel de significación** la **hipótesis nula** (H0) que aseguraba la **independencia** de nuestras variables predictoras respecto de la objetivo, excepto para la variable `Cabin`.
+Por tanto, al 5 % de significación, **no rechazamos** o **aceptamos** la hipótesis alternativa de **dependencia** entre predictoras y objetivo.
+
+Debido a que la variable `Cabin` ya iba a ser **eliminada** por su **elevado número de datos ausentes**, no habrá problema alguno.
+
+## Variables cuantitativas
+
+### Variable PassengerId
+
+```{r}
+titanic |>
+  count(PassengerId, sort = TRUE) |>
+  mutate(porc = 100*n/sum(n))
+```
+
+La variable `Name` presenta **891 modalidades**, una por cada pasajero en nuestro dataset.
+Dado que es una **variable identificador** y, como es obvio, es única para cada pasajero, *a priori* no parece interesante el mantenerla como tal.
+
+### Variable Age
+
+```{r}
+titanic |> 
+  drop_na(Age) |> 
+  summarise(min_lead = min(Age), max_lead = max(Age))
+```
+
+Como se puede observar, la variable `Age` incluye registros de individuos en un **rango de edad** desde las **42 semanas** hasta los **80 años**.
+Veamos ahora cuál es el peso sobre el total de cada una de las edades.
+
+```{r}
+titanic |>
+  count(Age, sort = TRUE) |> 
+  mutate(porc = 100*n/sum(n), cumul = cumsum(porc))
+```
+
+La **gran mayoría** de registros pertenecen a individuos con edades **desde los 18 hasta los 30 años**.
+A partir de los **40**, el número de registros **disminuye** progresivamente.
+Además, hay un gran porcentaje de datos ausentes (20 %).
+Grafiquemos ahora su relación con nuestra variable objetivo.
+
+```{r fig8, layout="l-body-outset", fig.width=13, fig.asp = .6}
+titanic |> 
+  ggplot(aes(x = Age, fill = Survived)) + 
+  geom_density(alpha = 0.8) +
+  labs(title = "Distribución de los supervivientes al accidente en función de su edad", x = "Edad", y = NULL) +
+  scale_fill_discrete(name = "¿Sobrevivió?", labels = c("No", "Sí")) +
+  theme_minimal() +
+  theme(text = element_text(face = "bold", size = 15), plot.title = element_text(hjust = 0.5), 
+        axis.title.x = element_text(vjust=-0.5))
+```
+
+Algunas apreciaciones a la luz del gráfico:
+
+-   En este gráfico de distribuciones podemos observar como el grupo de individuos con **mayor porcentaje de supervivencia** se corresponde en mayor medida con el rango etario de **menor edad** (0-10 años). Por contra, gran parte de los pasajeros **fallecidos** se sitúan en un rango entre los **20 y los 30 años**. Esto es debido fundamentalmente a que los **niños** junto con sus madres fueron los **primeros en ser evacuados**. Además, los pasajeros **hombres** con edades comprendidas entre los **20 y los 30 años** eran el grueso de la tripulación a bordo del barco, y los que fueron evacuados en último lugar, por lo que resulta coherente que sean el rango etario con **más porcentaje de fallecimientos**.
+-   Para el **rango etario 60-80**, que es el minoritario, también nos encontramos con un alto porcentaje de fallecidos.
+
+Con ello en mente, se optará en la fase de **recategorización** (al menos para Árboles) por transformar la variable cuantitativa `Age` en una *pseudo*-cualitativa por medio de la creación de **rangos etarios**.
+Concretamente, se optará por la creación de **cinco grupos de edad**: de **0 a 15 años**, de **15 a 30 años**, de **30 a 45 años**, de **45 a 60 años** y de **60 a 80 años**.
+A los **datos ausentes** lo más seguro es que se les acaba **imputando la media** (o la **moda** en el caso de que se recategorice en forma de rangos etarios).
+
+### Variable Fare
+
+```{r}
+titanic |> 
+  drop_na(Fare) |> 
+  summarise(min_lead = min(Fare), max_lead = max(Fare))
+```
+
+Como se puede observar, la variable `Fare` incluye registros de individuos con tarifas que abarcan desde los **0 \$** hasta los **512 \$**.
+Veamos ahora cuál es el peso sobre el total de cada uno de los tipos de tarifa.
+
+```{r}
+titanic |>
+  count(Fare, sort = TRUE) |> 
+  mutate(porc = 100*n/sum(n), cumul = cumsum(porc))
+```
+
+La **gran mayoría** de registros se corresponden con **tarifas relativamente baratas**.
+Las tarifas para camarotes **caros** son **minoritarias**.
+
+```{r fig9, layout="l-body-outset", fig.width=13, fig.asp = .6}
+titanic |> 
+  ggplot(aes(x = Fare, fill = Survived)) + 
+  geom_density(alpha = 0.8) +
+  labs(title = "Distribución de los supervivientes al accidente en función de la tarifa asociada a su billete", x = "Tarifa", y = NULL) +
+  scale_fill_discrete(name = "¿Sobrevivió?", labels = c("No", "Sí")) +
+  theme_minimal() +
+  theme(text = element_text(face = "bold", size = 15), plot.title = element_text(hjust = 0.5), 
+        axis.title.x = element_text(vjust=-0.5))
+```
+
+Algunas apreciaciones a la luz del gráfico:
+
+-   En este gráfico de distribuciones podemos observar como **a menor gasto** en concepto de tarifa, **mayor porcentaje de fallecimiento**.
+-   A partir de los **25 $**, el porcentaje de supervivientes **supera** al de fallecidos en todo momento.
+
+Con ello en mente, se optará en la fase de **recategorización** (al menos para Árboles) por transformar la variable cuantitativa `Fare` en una *pseudo*-cualitativa por medio de la creación de **categorías**.
+Concretamente, se optará por la creación de **dos categorías**: de **0 a 20 \$** y de **más de 20 \$** en concepto de tarifa.
+
+### Colinealidad
+
+Para terminar, comprobaremos a continuación los posibles **problemas de colinealidad** entre nuestras variables **numéricas**.
+
+```{r}
+library(corrr)
+cor_matrix <- 
+  titanic |> 
+  drop_na() |> 
+  select(where(is.numeric)) |> 
+  cor() |> round(2)
+cor_matrix
+```
+
+```{r}
+library(corrplot)
+cor_matrix |>
+  corrplot(method = "number", tl.cex = 0.55, number.cex = 0.7, type = "lower")
+```
+
+Según la matriz de correlaciones, **no parece existir** una **correlación elevada** entre ninguna variable.
+
+# Fase 1 y 3: Muestreo y modificación de los datos
+
+Tras la fase de exploración de los datos, continuaremos con las fases de **muestreo** y **modificación** de los datos.
+Dado que nuestro dataset contiene tan solo **891 observaciones**, no será necesario realizar muestreo (nos quedaríamos prácticamente sin filas si lo hacemos).
+Por otro lado, **iremos fijando semilla** a fin de poder sacar conclusiones de los resultados de nuestros distintos modelos.
+
+En segundo lugar, para la fase de **modificación** de los datos, consideraremos **dos apartados** principales.
+Uno primero en donde se ejecutarán las **modificaciones estructurales** que afecten a toda las base de datos (transformar variables a factores, problemas de codificación o de rango, variables que no aportan, creación de variables en general, etc.), y uno segundo en donde se llevarán a cabo aquellas **modificaciones** que afecten **a cada algoritmo en concreto** a modo de **receta** (normalización para la métrica, recategorización, tratamiento de outliers/ausentes, dummyficación, etc.).
+
+## Modificaciones estructurales sobre conjuntos test y train/validación
+
+En este caso, como **las particiones ya están realizadas**, vamos a **bindear** los subconjuntos y a aplicarles a ambos las **modificaciones estructurales** para que tengan la **misma forma**. Además, dado que en test no existe una columna con nuestra variable objetivo, vamos a **crearla artificialmente** y a **rellenarla** con **NA**.
+
+```{r}
+# Cargamos ambas particiones
+titanic_train <- read_csv("/Users/leztin/Desktop/DATOS/titanic_train.csv")
+titanic_test <- read_csv("/Users/leztin/Desktop/DATOS/titanic_test.csv")
+
+# Creamos en test una columna con la variable objetivo `Survived`
+titanic_test$Survived <- NA
+
+# Bindeamos ambos subconjuntos y les aplicamos las modificaciones estructurales
+titanic_complete <- 
+  rbind(titanic_train, titanic_test) |>   
+  mutate(Survived = as.character(Survived),
+         Pclass = as.character(Pclass),
+         SibSp = as.character(SibSp),
+         Parch = as.character(Parch)) |> 
+  separate(Name, sep = ",", into = c("Surname", "Title")) |> 
+  separate(Title, sep = " ", into = c("Name", "Title")) |> 
+  select(-c(Surname, Name, Ticket, Cabin, PassengerId)) |> 
+  mutate(across(where(is.character), as_factor)) |> 
+  mutate(Pclass = factor(Pclass, levels = c("3", "2", "1"),
+                         ordered = TRUE))
+```
+
+## División de particiones
+
+### Conjuntos train y test
+
+Tras **homogeneizar** los subconjuntos de train y test, los volvemos a **subdividir tal y como se encontraban en origen**.
+
+```{r}
+titanic_train <- titanic_complete[1:891,]
+titanic_test <- titanic_complete[892:1309,]
+```
+
+## Modificaciones dentro de la receta
+
+### Receta para el algoritmo KNN
+
+#### Aplicación de roles
+
+Tras las particiones, **definimos la receta**, indicándole el conjunto donde tenemos validación y train, y enfrentamos nuestra variable objetivo `Survived` con todas las demás.
+Después, **asignamos posibles roles**, sujetos a modificación, que nos permitan diferenciar acciones entre las variables.
+
+```{r}
+# Receta
+titanic_rec_knn <-
+  # Fórmula y datos
+  recipe(data = titanic_train, Survived ~ .)|>
+  # Roles
+  add_role(where(is.factor), new_role = "cualitativa") |> 
+  add_role(where(is.numeric), new_role = "cuantitativa") |> 
+  add_role(Sex, new_role = "binaria") |> 
+  add_role(Fare, new_role = "mediana") |> 
+  add_role(all_predictors()  & !Fare, new_role = "moda")
+```
+
+#### Reagrupación de las variables cualitativas
+
+En este apartado, **reagrupamos** las variables **cualitativas** con `step_mutate` con lo definido en la fase de exploración.
+Para el **algoritmo de clasificación KNN**, cuanto más **agrupadas** estén este tipo de categorías, **mejor**.
+
+```{r}
+titanic_rec_knn <- 
+  titanic_rec_knn |> 
+  step_other(Title, 
+                threshold = 0.01, other = "Others") |> 
+  step_mutate(SibSp = 
+                fct_collapse(SibSp, 
+                             More_than_one = c("2", "3", "4", "5", "8"))) |> 
+  step_mutate(Parch = 
+                fct_collapse(Parch, 
+                             More_than_two = c("3", "4", "5", "6"))) |>  
+  step_mutate(Embarked = 
+                fct_collapse(Embarked, 
+                             C = c("C", "NA")))
+```
+
+#### Recategorización de las variables cuantitativas
+
+En el algoritmo de clasificación **KNN**, la **recategorización** de las variables **cuantitativas no** es estrictamente **necesaria**.
+Por tanto, en este receta, del total de variables cuantitativas, únicamente vamos a agrupar mediante **rango etarios** la variable `age`, para facilitar la posible interpretación posterior de los resultados.
+Tras ello, la convertimos a **factor**.
+
+```{r}
+titanic_rec_knn <- 
+  titanic_rec_knn |> 
+    step_mutate(Age =
+                cut(Age,
+                    breaks = c(0, 15, 30, 45, 60, 80),
+                    labels = c("0-15", "16-30", "31-45", "46-60", "61-80"))) |> 
+    step_mutate(Age = factor(Age))
+```
+
+#### Outliers
+
+```{r}
+box1 <- 
+  ggplot(titanic, aes(Survived, Age)) +
+  geom_boxplot() +
+  theme_minimal() +
+  coord_flip()
+box2 <- 
+  ggplot(titanic, aes(Survived, Fare)) +
+  geom_boxplot() +
+  theme_minimal() +
+  coord_flip()
+
+Rmisc:::multiplot(box1, box2)
+```
+
+```{r eval = FALSE}
+abs(scores(titanic$Fare, type = "mad"))
+```
+
+Si observamos estos dos gráficos de cajas y bigotes para nuestras dos únicas variables cuantitativas, nos daremos cuenta de que la variable `Age` sigue una distribución bastante más simétrica que la de la variable `Fare`. Como la única variable que ha quedado sin recategorizar es `Fare`, y debido fundamentalmente a su **asimetría**, se ha decidido detectar los valores atípicos respecto a la **mediana** para luego **imputarles** este mismo valor a los **ausentes**. Para el resto de variables (transformadas todas a **cualitativas** por medio de categorías artificiales), **imputamos** directamente por la **moda**.
+
+```{r}
+titanic_rec_knn <-
+  titanic_rec_knn |> 
+  # Detección de outliers por la mediana
+  step_mutate(across(has_role("mediana"), function(x) { ifelse(abs(scores(x, type = "mad")) > 3 & !is.na(x), NA, x) })) |>   
+  # Imputación de ausentes por la mediana y la moda
+  step_impute_median(has_role("mediana")) |> 
+  step_impute_mode(has_role("moda"))
+```
+
+#### Filtro de correlación
+
+Aplicamos el **filtro de correlación** a nuestra única variable **numérica**.
+
+```{r}
+titanic_rec_knn <-
+  titanic_rec_knn |> 
+  step_corr(has_role("mediana"), threshold = 0.9)
+```
+
+#### Normalizar por rango
+
+En el caso del algoritmo **KNN**, necesitaremos **normalizar** nuestras variables por rango para que todas tengan **el mismo peso**, **entre 0 y 1**.
+
+```{r}
+titanic_rec_knn <-
+  titanic_rec_knn |> 
+  step_range(all_numeric_predictors(), min = 0, max = 1) |> 
+  step_other(all_nominal_predictors(), threshold = 0.02)
+```
+
+#### Variables dummy
+
+Como esta receta es para el modelo KNN, debemos **dummyficar** nuestras variables cualitativas.
+Para ello, tomamos **todas las nominales, menos nuestra variable objetivo**.
+
+```{r}
+titanic_rec_knn <-
+  titanic_rec_knn |>
+  step_dummy(all_nominal(), -all_outcomes())
+```
+
+#### Filtro de cero varianza
+
+```{r}
+titanic_rec_knn <-
+  titanic_rec_knn |>
+  step_zv(all_predictors())
+```
+
+#### Sobremuestreo
+
+Como tenemos a la **variable objetivo desbalanceada**, deberemos **sobremuestrear** para que nuestro modelo no solo aprenda de la **clase mayoritaria**.
+Tras varias pruebas, se ha decidido realizar en la receta un sobremuestreo con `step_rose` del paquete `{themis}`.
+
+```{r}
+titanic_rec_knn <-
+  titanic_rec_knn |> 
+  step_rose(Survived, over_ratio = 0.5)
+```
+
+#### Horneado
+
+Por último, **horneamos** nuestra receta para comprobar que todas nuestras **nuevas variables** recategorizadas se hayan creado **correctamente**.
+
+```{r}
+bake(titanic_rec_knn |>  prep(), new_data = NULL)
+```
+
+### Receta para el método árboles de clasificación
+
+#### Aplicación de roles
+
+En este segundo apartado repetiremos la receta, pero esta vez adaptada a los **árboles de clasificación**.
+
+```{r}
+# Receta
+titanic_rec_arbol <-
+  # Fórmula y datos
+  recipe(data = titanic_train, Survived ~ .)|>
+  # Roles
+  add_role(where(is.factor), new_role = "cualitativa") |> 
+  add_role(where(is.numeric), new_role = "cuantitativa") |> 
+  add_role(Sex, new_role = "binaria")
+```
+
+#### Reagrupación de las variables cualitativas
+
+En este apartado, **reagrupamos** las variables **cualitativas** con `step_mutate`. Para el método de **árboles de clasificación**, no es necesario agrupar en exceso este tipo de variables, por lo que se optará por reclasificar únicamente la variable `Title` en la que había **demasiados títulos con muy poca representación**, y la variable `Embarked` con sus **dos ausentes**.
+
+```{r}
+titanic_rec_arbol <- 
+  titanic_rec_arbol |> 
+  step_other(Title, 
+                threshold = 0.01, other = "Others") |> 
+  step_mutate(Embarked = 
+                fct_collapse(Embarked, 
+                             C = c("C", "NA")))
+```
+
+#### Recategorización de las variables cuantitativas
+
+Como esta receta es para el método de **árboles de clasificación**, tenemos que **recategorizar** todas las variables **cuantitativas**.
+En esta ocasión se ha incluido también la variable `Fare`.
+
+```{r}
+titanic_rec_arbol <- 
+  titanic_rec_arbol |> 
+    step_mutate(Age =
+                cut(Age,
+                    breaks = c(0, 15, 30, 45, 60, 80),
+                    labels = c("0-15", "16-30", "31-45", "46-60", "61-80"))) |> 
+    step_mutate(Fare =
+                cut(Fare,
+                    breaks = c(0, 20, Inf),
+                    labels = c("$0-$20", "$20+"))) |> 
+    step_mutate(Age = factor(Age),
+                Fare = factor(Fare))
+```
+
+#### Outliers
+
+```{r}
+Rmisc:::multiplot(box1, box2)
+```
+
+```{r eval = FALSE}
+abs(scores(titanic$Fare, type = "mad"))
+```
+
+Si observamos estos dos gráficos de cajas y bigotes para nuestras dos únicas variables cuantitativas, nos daremos cuenta de que la variable `Age` sigue una distribución bastante más simétrica que la de la variable `Fare`. Aún con todo, en esta receta se ha optado por **recategorizar** y **reagrupar** todas las variables, incluso las **cuantitativas**. De esta manera, **no hay outliers que detectar**, pues todas las nuevas categorías se han creado **manualmente** a partir de la agrupación de las antiguas modalidades. Aún así, imputamos a los posibles ausentes la **moda** al haber convertido todas las variables en **cualitativas**.
+
+```{r}
+titanic_rec_arbol <-
+  titanic_rec_arbol |> 
+  step_impute_mode(all_predictors())
+```
+
+#### Filtro de correlación
+
+Como todas nuestras variables están ahora **recategorizadas** y **convertidas a factor**, **no existen** variables estrictamente **numéricas** a las que aplicar el filtro de correlación.
+
+#### Normalizar por rango
+
+En árboles, **no será necesario normalizar por rango**.
+
+#### Variables dummy
+
+En árboles, **tampoco será necesario dummyficar**.
+
+#### Filtro de cero varianza
+
+```{r}
+titanic_rec_arbol <-
+  titanic_rec_arbol |>
+  step_zv(all_predictors())
+```
+
+#### Sobremuestreo
+
+Como tenemos a la **variable objetivo desbalanceada**, deberemos **sobremuestrear** para que nuestro modelo no solo aprenda de la **clase mayoritaria**.
+Tras varias pruebas, se ha decidido realizar en la receta un sobremuestreo con `step_upsample` del paquete `{themis}`.
+
+```{r}
+titanic_rec_arbol <-
+  titanic_rec_arbol |> 
+  step_upsample(Survived, over_ratio = 0.5)
+```
+
+#### Horneado
+
+Por último, **horneamos** nuestra receta para comprobar que todas nuestras **nuevas variables** recategorizadas se hayan creado **correctamente**.
+
+```{r}
+bake(titanic_rec_arbol |>  prep(), new_data = NULL)
+```
+
+### Receta para el método regresión logística
+
+#### Aplicación de roles
+
+Tras las particiones, **definimos la receta**, indicándole el conjunto donde tenemos validación y train, y enfrentamos nuestra variable objetivo `Survived` con todas las demás.
+Después, **asignamos posibles roles**, sujetos a modificación, que nos permitan diferenciar acciones entre las variables.
+
+```{r}
+# Receta
+titanic_rec_reg <-
+  # Fórmula y datos
+  recipe(data = titanic_train, Survived ~ .)|>
+  # Roles
+  add_role(where(is.factor), new_role = "cualitativa") |> 
+  add_role(where(is.numeric), new_role = "cuantitativa") |> 
+  add_role(Sex, new_role = "binaria") |> 
+  add_role(Fare, new_role = "mediana") |> 
+  add_role(all_predictors()  & !Fare, new_role = "moda")
+```
+
+#### Reagrupación de las variables cualitativas
+
+Agrupamos lo **mínimo**, como en árboles.
+
+```{r}
+titanic_rec_reg <- 
+  titanic_rec_reg |> 
+  step_other(Title, 
+                threshold = 0.01, other = "Others") |> 
+  step_mutate(Embarked = 
+                fct_collapse(Embarked, 
+                             C = c("C", "NA")))
+```
+
+#### Recategorización de las variables cuantitativas
+
+En esta receta, del total de variables cuantitativas, únicamente vamos a agrupar mediante **rango etarios** la variable `age`, para facilitar la posible interpretación posterior de los resultados.
+Tras ello, la convertimos a **factor**.
+
+```{r}
+titanic_rec_reg <- 
+  titanic_rec_reg |> 
+    step_mutate(Age =
+                cut(Age,
+                    breaks = c(0, 15, 30, 45, 60, 80),
+                    labels = c("0-15", "16-30", "31-45", "46-60", "61-80"))) |> 
+    step_mutate(Age = factor(Age))
+```
+
+#### Outliers
+
+```{r}
+Rmisc:::multiplot(box1, box2)
+```
+
+```{r eval = FALSE}
+abs(scores(titanic$Fare, type = "mad"))
+```
+
+Si observamos estos dos gráficos de cajas y bigotes para nuestras dos únicas variables cuantitativas, nos daremos cuenta de que la variable `Age` sigue una distribución bastante más simétrica que la de la variable `Fare`. Como la única variable que ha quedado sin recategorizar es `Fare`, y debido fundamentalmente a su **asimetría**, se ha decidido detectar los valores atípicos respecto a la **mediana** para luego **imputarles** este mismo valor a los **ausentes**. Para el resto de variables (transformadas todas a **cualitativas** por medio de categorías artificiales), **imputamos** directamente por la **moda**.
+
+```{r}
+titanic_rec_reg <-
+  titanic_rec_reg |> 
+  # Detección de outliers por la media
+  step_mutate(across(has_role("mediana"), function(x) { ifelse(abs(scores(x, type = "mad")) > 3 & !is.na(x), NA, x) })) |>   
+  # Imputación de ausentes por la media y la moda
+  step_impute_median(has_role("mediana")) |> 
+  step_impute_mode(has_role("moda"))
+```
+
+#### Filtro de correlación
+
+Aplicamos el **filtro de correlación** a nuestra única variable **numérica**.
+
+```{r}
+titanic_rec_reg <-
+  titanic_rec_reg |> 
+  step_corr(has_role("mediana"), threshold = 0.9)
+```
+
+#### Normalizar por rango
+
+Normalizamos por rango para que todas nuestras variables tengan **el mismo peso**.
+
+```{r}
+titanic_rec_reg <-
+  titanic_rec_reg |> 
+  step_range(all_numeric_predictors(), min = 0, max = 1) |> 
+  step_other(all_nominal_predictors(), threshold = 0.02)
+```
+
+#### Variables dummy
+
+Dummyficamos para **facilitar** posibles posteriores **interpretaciones** de nuestros datos.
+
+```{r}
+titanic_rec_reg <-
+  titanic_rec_reg |>
+  step_dummy(all_nominal(), -all_outcomes())
+```
+
+#### Filtro de cero varianza
+
+```{r}
+titanic_rec_reg <-
+  titanic_rec_reg |>
+  step_zv(all_predictors())
+```
+
+#### Sobremuestreo
+
+Como tenemos a la **variable objetivo desbalanceada**, deberemos **sobremuestrear** para que nuestro modelo no solo aprenda de la **clase mayoritaria**.
+Tras varias pruebas, se ha decidido realizar en la receta un sobremuestreo con `step_upsample` del paquete `{themis}`.
+
+```{r}
+titanic_rec_reg <-
+  titanic_rec_reg |> 
+  themis::step_upsample(Survived, over_ratio = 0.5)
+```
+
+#### Horneado
+
+Por último, **horneamos** nuestra receta para comprobar que todas nuestras **nuevas variables** recategorizadas se hayan creado **correctamente**.
+
+```{r}
+bake(titanic_rec_reg |>  prep(), new_data = NULL)
+```
+
+# Fase 4.1: Modelo y Flujo (KNN)
+
+Una vez definida la receta, definimos el **modelo** y lo unimos con nuestra receta creando un **flujo de clasificación**.
+Se trata de un nuevo modelo con `tune()` para poder definir posteriormente los parámetros de forma **manual**.
+
+```{r}
+# Modelo tuneado
+knn_model_tune <-
+  nearest_neighbor(mode = "classification", neighbors = tune("k"),
+                   weight_func = tune("weight"), dist_power = tune("dist")) |>
+  set_engine("kknn")
+
+# Flujo de trabajo
+titanic_wflow_knn <-
+  workflow() |>
+  add_recipe(titanic_rec_knn) |>
+  add_model(knn_model_tune)
+```
+
+# Fase 5.1: Evaluación en Validación Cruzada V-Folds (KNN) y predicción
+
+Para esta práctica evaluaremos directamente a través del **método de Validación Cruzada V-Folds**, que nos proporcionará además una **métrica media** con la **desviación típica** para cada modelo.
+
+## Creación del grid expandido
+
+Para ello, en primer lugar crearemos un **grid** con la función `expand_grid` que nos permitirá **definir manualmente** los **parámetros** que queramos sin estar condicionados por una función automática.
+De esta manera, podremos **probar** todas las **combinaciones** que queramos.
+Tras comprobar varias combinaciones, finalmente nos decantamos por la siguiente.
+
+```{r}
+grid_knn <-
+  expand_grid("k" = c(60, 80, 100, 150),
+              "weight" = c("inv", "gaussian"),
+              "dist" = c(0.01, 2, 5, 15, 20))
+grid_knn
+```
+
+## Aplicación del proceso de validación
+
+Aplicamos en esta fase el proceso de Validación Cruzada V-Folds.
+
+```{r}
+titanic_cv_folds <- vfold_cv(data = titanic_train, v = 8, repeats = 4, strata = Survived)
+titanic_cv_folds
+```
+
+```{r}
+set.seed(05491)
+
+clusters <- detectCores() - 1
+make_cluster <- makeCluster(clusters)
+registerDoParallel(make_cluster)
+
+titanic_knn_vf <-
+ titanic_wflow_knn |> 
+  tune_grid(resamples = titanic_cv_folds,
+            grid = grid_knn,
+            control = control_grid(verbose = TRUE, allow_par = TRUE,
+                                   pkgs = c("outliers", "tidyverse")),
+            metrics = metric_set(accuracy, sensitivity, specificity, roc_auc))
+
+# Finalizamos clusters
+stopCluster(make_cluster)
+registerDoSEQ()
+
+titanic_knn_vf |> collect_metrics()
+```
+
+## Elección del mejor de los modelos
+
+Con `show_best()` se muestran a continuación los **mejores modelos** según `accuracy`.
+
+```{r}
+# Se muestran los mejores según accuracy
+titanic_knn_vf |> show_best("accuracy")
+```
+
+## Finalización del flujo
+
+Tras elegir el mejor, **finalizamos el flujo con ese modelo elegido** empleando la función `finalize_workflow()`.
+
+```{r}
+# Finalizamos flujo con el mejor modelo según accuracy
+best_titanic_knn_vf <- 
+  titanic_knn_vf |> select_best("accuracy")
+
+final_wflow_knn <- 
+  titanic_wflow_knn |> 
+  finalize_workflow(best_titanic_knn_vf)
+
+final_wflow_knn
+```
+
+# Fase 4.2: Modelo y Flujo (Árboles) con poda
+
+A continuación, procederemos con el modelo para la **receta de árboles**.
+El modelo consistirá en un **árbol de clasificación** que implementaremos con `decision_tree()` y `mode = "classification"`.
+De nuevo, crearemos el modelo con `tune()` para poder definir posteriormente los parámetros de forma **manual**.
+Generamos un flujo de trabajo en función del **criterios de impureza de Gini**.
+
+Por otro lado, añadiremos también directamente el parámetro `cost_complexity`, que se usa en la fase de **poda (prune)**, y que introduce un componente **penalizador** para evitar modelos **sobreajustados**.
+
+```{r}
+# Modelo con tres parámetros tuneados
+decision_tree_gini <-
+  decision_tree(tree_depth = tune("depth"), min_n = tune("min_n"), 
+                cost_complexity = tune("cost")) |> 
+  set_engine("rpart") |> 
+  set_mode("classification")
+```
+
+```{r}
+# Flujo de trabajo
+titanic_tree_gini_wflow <-
+  workflow() |>
+  add_recipe(titanic_rec_arbol) |>
+  add_model(decision_tree_gini)
+```
+
+# Fase 5.2: Evaluación en Validación Cruzada V-Folds (Árboles) y predicción
+
+Para este modelo, volvemos a evaluar a través del **método de Validación Cruzada V-Folds**, que nos proporcionará además una **métrica media** con la **desviación típica** para cada modelo.
+
+## Creación de los grid expandidos
+
+Para ello, en primer lugar crearemos dos **grid** con la función `expand_grid` que nos permitirán **definir manualmente** los **parámetros** que queramos sin estar condicionados por una función automática.
+De nuevo, tras comprobar varias combinaciones, nos decantaremos finalmente por las siguientes.
+
+```{r}
+grid_tree_gini <-
+  expand_grid("depth" = c(2, 4, 6, 8, 10),
+              "min_n" = c(10, 50, 100, 150),
+              "cost" = 10^c(-5, -3, -2, -0.5))
+```
+
+Crearemos en este caso **80 modelos** ($5*4*4$).
+
+## Aplicación del proceso de validación
+
+Aplicamos en esta fase el proceso de **Validación Cruzada V-Folds**.
+
+```{r}
+set.seed(05491)
+
+clusters <- detectCores() - 1
+make_cluster <- makeCluster(clusters)
+registerDoParallel(make_cluster)
+
+titanic_tree_gini <-
+  titanic_tree_gini_wflow |> 
+  tune_grid(resamples = titanic_cv_folds,
+            grid = grid_tree_gini,
+            control = control_grid(verbose = TRUE, allow_par = TRUE,
+                                   pkgs = c("outliers", "tidyverse"), save_pred = TRUE),
+            metrics = metric_set(accuracy, sensitivity,
+                                 specificity, roc_auc))
+
+# Finalizamos clusters
+stopCluster(make_cluster)
+registerDoSEQ()
+
+titanic_tree_gini |> collect_metrics()
+```
+
+## Elección del mejor de los modelos
+
+Como sucedía en el modelo KNN, procedemos a ver los mejores con `show_best()`.
+
+```{r}
+# Mejores modelos según curva roc y accuracy
+titanic_tree_gini |>  show_best("roc_auc", n = 10)
+titanic_tree_gini |> show_best("accuracy", n = 10)
+```
+
+## Finalización del flujo
+
+Tras elegir el mejor, **finalizamos el flujo con ese modelo elegido** empleando la función `finalize_workflow()`.
+
+```{r}
+# Finalizamos flujo con el mejor modelo según accuracy
+best_titanic_tree_gini <-
+  titanic_tree_gini |> select_best("accuracy")
+
+final_wf_tree_gini <- 
+  titanic_tree_gini_wflow |> 
+  finalize_workflow(best_titanic_tree_gini)
+
+final_wf_tree_gini
+```
+
+# Fase 4.3: Modelo y Flujo (Random Forest)
+
+Para ir finalizando la práctica lanzaremos un **Random Forest**, esto es, una combinación de árboles predictores tal que **cada árbol depende de los valores de un vector aleatorio**, probado **independientemente**, y con la **misma distribución** para cada uno de ellos.
+Es una modificación sustancial de los métodos de **bagging**, en donde se construyen una larga colección de **árboles no correlacionados** y luego los **promedia**.
+
+Lanzaremos **1000 árboles** seleccionando **21 configuraciones** posibles del par `mtry`-`min_n` para decidir cual es el par de hiperparámetros **más óptimo** (en total, 21 000 árboles).
+
+```{r}
+# Modelo Random Forest
+rf_titanic <-
+  rand_forest(mode = "classification",
+              mtry = tune("n_pred"),
+              min_n = tune("min_n"),
+              trees = 1000) |> 
+  set_engine("ranger", num.threads = 7)
+
+# Flujo de trabajo
+titanic_rf_wflow <-
+  workflow() |> 
+  add_recipe(titanic_rec_arbol) |> 
+  add_model(rf_titanic)
+```
+
+# Fase 5.3: Evaluación en Validación Cruzada V-Folds (Random Forest) y predicción
+
+## Creación del grid expandido
+
+```{r}
+grid_rf <- 
+  expand_grid("n_pred" = c(1, 2, 3),
+              "min_n" = c(5, 7, 10, 20, 30, 40))
+```
+
+## Aplicación del proceso de validación
+
+```{r}
+set.seed(05491)
+
+clusters <- detectCores() - 1
+make_cluster <- makeCluster(clusters)
+registerDoParallel(make_cluster)
+
+rf_tune_par <- 
+  titanic_rf_wflow |> 
+  tune_grid(resamples = titanic_cv_folds,
+            grid = grid_rf,
+            metrics = metric_set(accuracy, sensitivity, specificity, roc_auc),
+            control = control_grid(verbose = TRUE,
+                                   allow_par = TRUE,
+                                   pkgs = c("outliers", "tidyverse"),
+                                   save_pred = TRUE))
+
+# Finalizamos clusters
+stopCluster(make_cluster)
+registerDoSEQ()
+
+rf_tune_par |> collect_metrics()
+```
+
+## Elección del mejor de los modelos y finalización del flujo
+
+```{r}
+# Finalizamos flujo con el mejor modelo según accuracy
+best_rf_tune_par <-
+  rf_tune_par |> select_best("accuracy")
+
+final_titanic_rf_wflow <- 
+  titanic_rf_wflow |> 
+  finalize_workflow(best_rf_tune_par)
+
+final_titanic_rf_wflow
+```
+
+# Fase 4.4: Modelo y Flujo (Regresión logística)
+
+Para finalizar la práctica lanzaremos una **regresión logística**. En este caso, el modelo no presenta parámetros para tunear, por lo que, en principio, **no sería necesario hacer validación**. En nuestro caso, sí que la haremos para poder **comparar** esta fase con el resto de modelos y así poder **seleccionar el mejor de todos**.
+
+```{r}
+# Regresión logística
+logit_mod <- 
+  logistic_reg() |> 
+  set_engine("glm")
+
+# Flujo de trabajo
+titanic_reg_wflow <- 
+  workflow() |> 
+  add_recipe(titanic_rec_reg) |> 
+  add_model(logit_mod)
+```
+
+# Fase 5.3: Evaluación en Validación Cruzada V-Folds (Regresión logística) y predicción
+
+## Aplicación del proceso de validación
+
+```{r}
+set.seed(05491)
+
+clusters <- detectCores() - 1
+make_cluster <- makeCluster(clusters)
+registerDoParallel(make_cluster)
+
+reg_tune_par <- 
+  titanic_reg_wflow |> 
+  tune_grid(resamples = titanic_cv_folds,
+            metrics = metric_set(accuracy, sensitivity, specificity, roc_auc),
+            control = control_grid(verbose = TRUE,
+                                   allow_par = TRUE,
+                                   pkgs = c("outliers", "tidyverse"),
+                                   save_pred = TRUE))
+
+# Finalizamos clusters
+stopCluster(make_cluster)
+registerDoSEQ()
+
+reg_tune_par |> collect_metrics()
+```
+
+## Elección del mejor de los modelos y finalización del flujo
+
+```{r}
+# Finalizamos flujo con el mejor modelo según specificity (siempre es el mismo)
+best_reg_tune_par <-
+  reg_tune_par |> select_best("accuracy")
+
+final_titanic_reg_wflow <- 
+  titanic_reg_wflow |> 
+  finalize_workflow(best_reg_tune_par)
+
+final_titanic_reg_wflow
+```
+
+# Comparativa final entre modelos: KNN, Árboles, Random Forest y Regresión Logística y predicción para Kaggle
+
+En total en esta práctica se han lanzado cuatro modelos: un **KNN**, un **Árbol**, un **Random Forest** y una **Regresión Logística**.
+A continuación un resumen de sus métricas para hacer la **comparativa**:
+
+## Métricas de los modelos
+
+```{r}
+# Modelo KNN
+titanic_knn_vf |> 
+  collect_metrics() |> 
+  filter(.config == pull(select(best_titanic_knn_vf, .config)))
+
+# Modelo Árbol Gini
+titanic_tree_gini |> 
+  collect_metrics() |> 
+  filter(.config == pull(select(best_titanic_tree_gini, .config)))
+
+# Modelo Random Forest
+rf_tune_par |> 
+  collect_metrics() |> 
+  filter(.config == pull(select(best_rf_tune_par, .config)))
+
+# Modelo Regresión Logística
+reg_tune_par |> 
+  collect_metrics()
+```
+
+-   **Precisión**: el modelo que más destaca es el **Random Forest**, con una precisión del **83 %** seguida muy de cerca por el **Árbol** y la **Regresión Logística**.
+-   **Sensibilidad (porcentaje de verdaderos positivos)**: el modelo que más destaca en sensibilidad es el **Random Forest** con un valor del **90 %**.
+-   **Especificidad (porcentaje de verdaderos negativos)**: el modelo que más destaca en especificidad es la **Regresión Logística** con un valor del **74 %**.
+-   **Valor curva ROC**: respecto al valor de la curva ROC, el modelo **Random Forest** es también el que **más destaca** con un **86,4 %**. El resto de modelos ofrecen resultados muy similares, **nunca inferiores al 80 %**.
+
+## Predicción para el mejor modelo: Random Forest
+
+Nos quedamos finalmente con el **Random Forest** (nos salió un **0.77511** de **score** :D)
+
+```{r}
+# Ajuste
+titanic_rf_fit <- 
+  fit(final_titanic_rf_wflow, titanic_train)
+
+# Predicciones
+pred_reg <-
+  predict(titanic_rf_fit, titanic_test)
+summary(pred_reg)
+
+# Visualización de las predicciones para cada `PassengerID`
+final_pred <- 
+  data.frame(PassengerID = c(892:1309), pred_reg) |> 
+  rename(Survived = .pred_class)
+head(final_pred)
+
+# Exportamos nuestro dataframe para subirlo a Kaggle
+write.csv(final_pred, file = 'titanic_entrega_rf.csv', row.names = FALSE)
+```
